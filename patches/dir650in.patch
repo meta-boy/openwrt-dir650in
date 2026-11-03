@@ -1,0 +1,950 @@
+diff -ruN a/target/linux/rtl819x/base-files/etc/board.d/02_network b/target/linux/rtl819x/base-files/etc/board.d/02_network
+--- a/target/linux/rtl819x/base-files/etc/board.d/02_network
++++ b/target/linux/rtl819x/base-files/etc/board.d/02_network
+@@ -19,9 +19,18 @@
+ # Ports of the external RTL8367D switch (swconfig switch0): 0 = blue WAN,
+ # 3 = LAN1, 4 = LAN2, 7 = CPU (tagged). VLANs become 9 (LAN) and 8 (WAN)
+ # on first boot, see uci-defaults/06_switch_vlan_ids.
+-ucidef_add_switch "switch0" \
+-	"3:lan:1" "4:lan:2" "0:wan" "7t@eth0"
+-ucidef_set_interface "lan" protocol "static" ipaddr "192.168.0.1" netmask "255.255.255.0"
++case "$(board_name)" in
++dlink,dir-650in)
++	# jacks on internal switch ports 0-4, untagged on eth0; repeater = one LAN bridge
++	ucidef_set_interface_lan "eth0"
++	ucidef_set_interface "lan" protocol "static" ipaddr "192.168.1.1" netmask "255.255.255.0"
++	;;
++*)
++	ucidef_add_switch "switch0" \
++		"3:lan:1" "4:lan:2" "0:wan" "7t@eth0"
++	ucidef_set_interface "lan" protocol "static" ipaddr "192.168.0.1" netmask "255.255.255.0"
++	;;
++esac
+ 
+ board_config_flush
+ 
+diff -ruN a/target/linux/rtl819x/base-files/lib/netifd/wireless/rtl8192cd.sh b/target/linux/rtl819x/base-files/lib/netifd/wireless/rtl8192cd.sh
+--- a/target/linux/rtl819x/base-files/lib/netifd/wireless/rtl8192cd.sh
++++ b/target/linux/rtl819x/base-files/lib/netifd/wireless/rtl8192cd.sh
+@@ -46,6 +46,7 @@
+ drv_rtl8192cd_init_iface_config() {
+ 	config_add_boolean hidden wmm isolate short_preamble
+ 	config_add_string macfilter ieee80211w
++	config_add_string bssid
+ 	config_add_array maclist
+ 	config_add_int dtim_period wpa_group_rekey max_inactivity
+ 	config_add_string key1 key2 key3 key4
+@@ -416,6 +417,59 @@
+ 	vif_idx=$((vif_idx + 1))
+ }
+ 
++# Client / repeater uplink (mode sta) on the driver's universal-repeater interface
++# <radio>-vxd. The root AP (<radio>) must already be configured; the driver moves the
++# radio to the upstream AP's channel by itself. Only WPA/WPA2-PSK and open networks.
++rtl_setup_sta() {
++	local name="$1"
++	local ifname ssid key bssid macaddr wpa auth_type wpa_cipher
++	local psk_enable=0 encmode=0 cipher_mask=0 ieee8021x=0 authtype=2
++
++	ifname="${dev_ifname}-vxd"
++
++	json_select config
++	json_get_vars ssid key bssid macaddr
++	wireless_vif_parse_encryption
++	json_select ..
++
++	[ -d "/proc/$ifname" ] || { wireless_setup_vif_failed NO_SUCH_INTERFACE; return 1; }
++	[ -n "$ssid" ] || { wireless_setup_vif_failed MISSING_SSID; return 1; }
++
++	case "$wpa_cipher" in
++		*CCMP*TKIP*|*TKIP*CCMP*) cipher_mask=10; encmode=4 ;;
++		*CCMP*)                  cipher_mask=8;  encmode=4 ;;
++		*TKIP*)                  cipher_mask=2;  encmode=2 ;;
++	esac
++	case "$auth_type" in
++		psk)
++			psk_enable="$wpa"; ieee8021x=0
++			[ ${#key} -ge 8 ] || { wireless_setup_vif_failed INVALID_WPA_PSK; return 1; }
++		;;
++		none) psk_enable=0; encmode=0; cipher_mask=0 ;;
++		*) wireless_setup_vif_failed UNSUPPORTED_ENCRYPTION; return 1 ;;
++	esac
++
++	ifconfig "$ifname" down 2>/dev/null
++	[ -n "$macaddr" ] && ip link set dev "$ifname" address "$macaddr"
++
++	rtl_apply_mib "$ifname" \
++		"opmode=8" \
++		"ssid=$ssid" \
++		"authtype=$authtype" \
++		"psk_enable=$psk_enable" \
++		"encmode=$encmode" \
++		"802_1x=$ieee8021x" \
++		"wpa_cipher=$([ "$psk_enable" = 1 ] || [ "$psk_enable" = 3 ] && echo $cipher_mask || echo 0)" \
++		"wpa2_cipher=$([ "$psk_enable" -ge 2 ] 2>/dev/null && echo $cipher_mask || echo 0)" || {
++		wireless_setup_vif_failed MIB_WRITE_FAILED; return 1; }
++	if [ "$psk_enable" != 0 ]; then
++		rtl_apply_mib "$ifname" "passphrase=$key" || { wireless_setup_vif_failed KEY_WRITE_FAILED; return 1; }
++	fi
++
++	ifconfig "$ifname" up || { wireless_setup_vif_failed IFUP_FAILED; return 1; }
++	wireless_add_vif "$name" "$ifname"
++}
++
+ drv_rtl8192cd_setup() {
+ 	local dev="$1"
+ 	local dev_ifname raw_htmode band ampdu country country_str regdomain vif_idx=0
+@@ -501,8 +555,10 @@
+ 		return 1
+ 	}
+ 
+-	for_each_interface "sta adhoc mesh monitor wds" rtl_unsupported_vif
++	for_each_interface "adhoc mesh monitor wds" rtl_unsupported_vif
+ 	for_each_interface "ap" rtl_setup_vif
++	# uplink last: the repeater interface rides on the configured root AP
++	for_each_interface "sta" rtl_setup_sta
+ 
+ 	wireless_set_up
+ }
+@@ -515,7 +571,7 @@
+ 	json_select ..
+ 	dev_ifname="${ifname:-wlan${dev#radio}}"
+ 
+-	for vif in "$dev_ifname" "$dev_ifname"-va0 "$dev_ifname"-va1 "$dev_ifname"-va2 "$dev_ifname"-va3; do
++	for vif in "$dev_ifname"-vxd "$dev_ifname" "$dev_ifname"-va0 "$dev_ifname"-va1 "$dev_ifname"-va2 "$dev_ifname"-va3; do
+ 		[ -d "/proc/$vif" ] && ifconfig "$vif" down 2>/dev/null
+ 	done
+ }
+diff -ruN a/target/linux/rtl819x/dir650in.diffconfig b/target/linux/rtl819x/dir650in.diffconfig
+--- a/target/linux/rtl819x/dir650in.diffconfig
++++ b/target/linux/rtl819x/dir650in.diffconfig
+@@ -0,0 +1,56 @@
++CONFIG_TARGET_rtl819x=y
++CONFIG_TARGET_rtl819x_rtl8197f=y
++CONFIG_TARGET_rtl819x_rtl8197f_DEVICE_dlink_dir-650in=y
++CONFIG_TARGET_ROOTFS_INITRAMFS=y
++# CONFIG_FEED_luci is not set
++# CONFIG_FEED_packages is not set
++CONFIG_PACKAGE_swconfig=y
++CONFIG_NVMEM=y
++CONFIG_KERNEL_DEVMEM=y
++CONFIG_BUSYBOX_CUSTOM=y
++CONFIG_BUSYBOX_CONFIG_DEVMEM=y
++CONFIG_PACKAGE_wifi-scripts=y
++# CONFIG_PACKAGE_ppp is not set
++# CONFIG_PACKAGE_ppp-mod-pppoe is not set
++# CONFIG_PACKAGE_kmod-ppp is not set
++# CONFIG_PACKAGE_kmod-pppoe is not set
++# CONFIG_PACKAGE_kmod-pppox is not set
++# CONFIG_PACKAGE_kmod-slhc is not set
++CONFIG_TARGET_ROOTFS_SQUASHFS=y
++# CONFIG_PACKAGE_apk-mbedtls is not set
++# CONFIG_PACKAGE_apk-openssl is not set
++# CONFIG_PACKAGE_ca-bundle is not set
++# CONFIG_PACKAGE_libmbedtls is not set
++# CONFIG_PACKAGE_uclient-fetch is not set
++# CONFIG_PACKAGE_libustream-mbedtls is not set
++# CONFIG_PACKAGE_libmbedtls is not set
++# CONFIG_PACKAGE_openwrt-keyring is not set
++# CONFIG_PACKAGE_usign is not set
++# CONFIG_PACKAGE_odhcpd-ipv6only is not set
++# CONFIG_PACKAGE_odhcpd is not set
++# CONFIG_PACKAGE_odhcp6c is not set
++# CONFIG_PACKAGE_firewall4 is not set
++# CONFIG_PACKAGE_nftables-json is not set
++# CONFIG_PACKAGE_nftables-nojson is not set
++# CONFIG_PACKAGE_kmod-nft-offload is not set
++# CONFIG_PACKAGE_kmod-nft-core is not set
++# CONFIG_PACKAGE_kmod-nft-nat is not set
++# CONFIG_PACKAGE_kmod-nft-fib is not set
++# CONFIG_PACKAGE_kmod-nf-flow is not set
++# CONFIG_PACKAGE_kmod-nf-nat is not set
++# CONFIG_PACKAGE_kmod-nf-conntrack is not set
++# CONFIG_PACKAGE_kmod-nf-log is not set
++# CONFIG_PACKAGE_kmod-nf-log6 is not set
++# CONFIG_PACKAGE_kmod-nf-reject is not set
++# CONFIG_PACKAGE_kmod-nf-reject6 is not set
++# CONFIG_PACKAGE_kmod-nfnetlink is not set
++# CONFIG_PACKAGE_libnftnl is not set
++# CONFIG_PACKAGE_jansson4 is not set
++CONFIG_PACKAGE_uhttpd=y
++# CONFIG_IPV6 is not set
++# CONFIG_KERNEL_IPV6 is not set
++CONFIG_PACKAGE_umdns=y
++# CONFIG_KERNEL_DEBUG_FS is not set
++# CONFIG_KERNEL_SECCOMP is not set
++# CONFIG_KERNEL_SECCOMP_FILTER is not set
++# CONFIG_PACKAGE_procd-seccomp is not set
+diff -ruN a/target/linux/rtl819x/dts/rtl8197f_dlink_dir-650in.dts b/target/linux/rtl819x/dts/rtl8197f_dlink_dir-650in.dts
+--- a/target/linux/rtl819x/dts/rtl8197f_dlink_dir-650in.dts
++++ b/target/linux/rtl819x/dts/rtl8197f_dlink_dir-650in.dts
+@@ -0,0 +1,111 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * D-Link DIR-650IN (ODM board JCG JIR-N700R V1.0)
++ *
++ *   SoC   RTL8197FH-VG, MIPS 24Kc @ 1 GHz
++ *   RAM   64 MB DDR2 (in package)
++ *   Flash 4 MB SPI NOR, EON EN25QH32B
++ *   LAN   internal switch ports 0-3, WAN = port 4, all 10/100 internal PHYs
++ *   WLAN  built-in 2.4 GHz 2T2R only
++ *   UART  38400 8N1, header next to the flash (VCC GND TX RX)
++ *
++ * Stock flash map (from /proc/mtd and the image itself):
++ *   0x000000 bootloader, 0x020000 hwconfig ("H6", MAC at 0x20007),
++ *   0x02a000 compressed settings, 0x030000 kernel (cr6c),
++ *   0x210000 squashfs rootfs, 0x3e0000 jffs2.
++ *
++ * Flash layout mirrors stock (verified against the stock image): kernel at
++ * 0x30000, rootfs at 0x210000 - the bootloader checks both. boot stays read-only.
++ */
++/dts-v1/;
++
++#include "RTL8197FVG.dtsi"
++
++#include <dt-bindings/gpio/gpio.h>
++
++/ {
++	compatible = "dlink,dir-650in", "realtek,rtl8197f-soc";
++	model = "D-Link DIR-650IN";
++
++	memory {
++		device_type = "memory";
++		reg = <0x0 0x4000000>;
++	};
++
++	chosen {
++		bootargs = "console=ttyS0,38400";
++	};
++};
++
++&gpio0 {
++	status = "okay";
++};
++
++&gpio1 {
++	status = "okay";
++};
++
++&ethernet {
++	status = "okay";
++
++	/* jacks sit on the SoC's own PHYs: no RGMII, no external switch */
++	realtek,internal-phy;
++
++	nvmem-cells = <&mac_factory>;
++	nvmem-cell-names = "mac-address";
++};
++
++&spi0 {
++	status = "okay";
++
++	flash@0 {
++		#address-cells = <1>;
++		#size-cells = <1>;
++		compatible = "jedec,spi-nor";
++		reg = <0>;
++		spi-max-frequency = <15000000>;
++
++		partitions {
++			compatible = "fixed-partitions";
++			#address-cells = <1>;
++			#size-cells = <1>;
++
++			partition@0 {
++				label = "boot";
++				reg = <0x000000 0x030000>;
++				read-only;
++
++				#address-cells = <1>;
++				#size-cells = <1>;
++
++				nvmem-layout {
++					compatible = "fixed-layout";
++					#address-cells = <1>;
++					#size-cells = <1>;
++
++					mac_factory: macaddr@20007 {
++						compatible = "mac-base";
++						reg = <0x20007 0x6>;
++					};
++				};
++			};
++
++			partition@30000 {
++				label = "kernel";
++				reg = <0x030000 0x1e0000>;
++			};
++
++			/* squashfs + bootloader checksum; the kernel splits off rootfs_data after it */
++			partition@210000 {
++				label = "rootfs";
++				reg = <0x210000 0x1f0000>;
++			};
++
++			/* kernel + rootfs together, for sysupgrade / mtd write */
++			firmware@30000 {
++				label = "firmware";
++				reg = <0x030000 0x3d0000>;
++			};
++		};
++	};
++};
+diff -ruN a/target/linux/rtl819x/files-6.18/drivers/net/ethernet/rtl819x_eth.c b/target/linux/rtl819x/files-6.18/drivers/net/ethernet/rtl819x_eth.c
+--- a/target/linux/rtl819x/files-6.18/drivers/net/ethernet/rtl819x_eth.c
++++ b/target/linux/rtl819x/files-6.18/drivers/net/ethernet/rtl819x_eth.c
+@@ -55,6 +55,8 @@
+ #define RTL_WAN_VID		8
+ /* режим роутера, см. rtl819x_tx_gnezda() */
+ static bool rtl819x_router;
++/* DIR-650IN style boards: jacks on internal PHYs 0-4, no RGMII/external switch */
++static bool rtl819x_internal_phy;
+ #define RTL_WAN_GNEZDO		0	/* порт 8367 синего гнезда WAN */
+ static void rtl819x_fdb_learn(const u8 *mac, unsigned int port);
+ 
+@@ -1544,7 +1546,8 @@
+ 	 *   devmem 0xbb80414c 32 0x06037d57  - как v6.5
+ 	 *   devmem 0xbb80414c 32 0x02037d57  - v6.6
+ 	 */
+-	rtl_sw_w(0xBB80414C, 0x02037D57);
++	if (!rtl819x_internal_phy)
++		rtl_sw_w(0xBB80414C, 0x02037D57);
+ 	rtl_sw_w(0xBB804204, 0x00000001);
+ 	rtl_sw_w(0xBB804234, 0x03007F7F);
+ 	rtl_sw_w(0xBB804300, 0x00200000);
+@@ -1567,11 +1570,19 @@
+ 	 * Признак, по которому видно, что связь между коммутаторами встала:
+ 	 * PSRP0 становится 0x307A вместо 0x30E0, как у портов без пары.
+ 	 */
++	if (rtl819x_internal_phy) {
++		rtl_sw_w(RTL_PCRP(0), 0x40FF0039);
++		rtl_sw_w(RTL_PCRP(1), 0x44FF0039);
++		rtl_sw_w(RTL_PCRP(2), 0x48FF0039);
++		rtl_sw_w(RTL_PCRP(3), 0x4CFF0039);
++		rtl_sw_w(RTL_PCRP(4), 0x507F0039);
++	} else {
+ 	rtl_sw_w(RTL_PCRP(0), 0x16972039);
+ 	rtl_sw_w(RTL_PCRP(1), 0x447F0039);
+ 	rtl_sw_w(RTL_PCRP(2), 0x487F0039);
+ 	rtl_sw_w(RTL_PCRP(3), 0x4C7F0039);
+ 	rtl_sw_w(RTL_PCRP(4), 0x507F0039);
++	}
+ 
+ 	/*
+ 	 * Внутренние порты, включая восьмой - порт процессора. Их я в первый
+@@ -2020,6 +2031,14 @@
+ 
+ 	spin_lock_init(&eth->lock);
+ 
++	rtl819x_internal_phy = of_property_read_bool(np, "realtek,internal-phy");
++	if (rtl819x_internal_phy) {
++		/* flat bring-up: LAN frames to all jacks 0-4, WAN (eth0.8) to port 4 */
++		rtl819x_gnezda_lan = 0x1F;
++		rtl819x_gnezda_wan = 0x10;
++		dev_info(&pdev->dev, "internal-PHY mode: jacks on ports 0-4\n");
++	}
++
+ 	eth->base = devm_platform_ioremap_resource(pdev, 0);
+ 	if (IS_ERR(eth->base))
+ 		return PTR_ERR(eth->base);
+diff -ruN a/target/linux/rtl819x/files-6.18/drivers/net/wireless/rtl8192fe/8192cd_osdep.c b/target/linux/rtl819x/files-6.18/drivers/net/wireless/rtl8192fe/8192cd_osdep.c
+--- a/target/linux/rtl819x/files-6.18/drivers/net/wireless/rtl8192fe/8192cd_osdep.c
++++ b/target/linux/rtl819x/files-6.18/drivers/net/wireless/rtl8192fe/8192cd_osdep.c
+@@ -19891,6 +19891,14 @@
+ 		}
+ #else
+ 
++		{
++			extern int rx_pcie_present(void);
++			if ((((wlan_device[wlan_index].type >> TYPE_SHIFT) & TYPE_MASK) == TYPE_PCI_DIRECT) &&
++			    !rx_pcie_present()) {
++				printk("rtl8192cd: slot %d is PCIe but DT has no PCIe controller - skipped\n", wlan_index);
++				continue;
++			}
++		}
+ 		modlog("=>rtl8192cd_init_one [root]");
+ 		rc = rtl8192cd_init_one(NULL, NULL, &wlan_device[wlan_index], -1);
+ 		if (rc){
+diff -ruN a/target/linux/rtl819x/files-6.18/drivers/net/wireless/rtl8192fe/compat_bsp_glue.c b/target/linux/rtl819x/files-6.18/drivers/net/wireless/rtl8192fe/compat_bsp_glue.c
+--- a/target/linux/rtl819x/files-6.18/drivers/net/wireless/rtl8192fe/compat_bsp_glue.c
++++ b/target/linux/rtl819x/files-6.18/drivers/net/wireless/rtl8192fe/compat_bsp_glue.c
+@@ -9,6 +9,17 @@
+ #include <linux/moduleparam.h>
+ #include <linux/printk.h>
+ #include <linux/delay.h>
++#include <linux/of.h>
++
++/* 1 if the board DT has an enabled PCIe controller (5 GHz RTL8812FE slot) */
++int rx_pcie_present(void)
++{
++	struct device_node *np = of_find_compatible_node(NULL, NULL, "realtek,rtl8196b-pci");
++	int ok = np && of_device_is_available(np);
++
++	of_node_put(np);
++	return ok;
++}
+ 
+ /*
+  * Адреса регистров приёма/передачи UART0. Ядро Realtek выбирало их при
+diff -ruN a/target/linux/rtl819x/files-6.18/drivers/net/wireless/rtl8192fe/rx23302.mk b/target/linux/rtl819x/files-6.18/drivers/net/wireless/rtl8192fe/rx23302.mk
+--- a/target/linux/rtl819x/files-6.18/drivers/net/wireless/rtl8192fe/rx23302.mk
++++ b/target/linux/rtl819x/files-6.18/drivers/net/wireless/rtl8192fe/rx23302.mk
+@@ -11,13 +11,6 @@
+ CONFIG_SOC_RFE_TYPE_0 := y
+ CONFIG_BAND_2G_ON_WLAN0 := y
+ CONFIG_2G_ON_WLAN0 := y
+-CONFIG_USE_PCIE_SLOT_0 := y
+-CONFIG_SLOT_0_8812FE := y
+-CONFIG_WLAN_HAL_8812FE := y
+-CONFIG_RTL_8812F_SUPPORT := y
+-CONFIG_SLOT_0_RFE_TYPE_0 := y
+-CONFIG_WLAN_MACHAL_API := y
+-CONFIG_WLAN_MACHAL_API_V0 := y
+ CONFIG_RTL_VAP_SUPPORT := y
+ CONFIG_RTL_CLIENT_MODE_SUPPORT := y
+ CONFIG_RTL_REPEATER_MODE_SUPPORT := y
+@@ -44,6 +37,6 @@
+ #   SHRINK_MEMORY_SIZE остаётся ради кольца приёма 256 и пула skb 768 - ОЗУ 55 МБ.
+ CONFIG_RTL_11W_SUPPORT := y
+ 
+-RX23302_DEFS := -DCONFIG_RTL8192CD -DCONFIG_SOC_WIFI -DCONFIG_WLAN_HAL -DCONFIG_WLAN_HAL_88XX -DCONFIG_PCI_HCI -DCONFIG_WIFI_HCI -DCONFIG_RTL_ODM_WLAN_DRIVER -DCONFIG_WLAN_HAL_8197G -DCONFIG_SOC_RFE_TYPE_0 -DCONFIG_BAND_2G_ON_WLAN0 -DCONFIG_2G_ON_WLAN0 -DCONFIG_USE_PCIE_SLOT_0 -DCONFIG_SLOT_0_8812FE -DCONFIG_WLAN_HAL_8812FE -DCONFIG_SLOT_0_RFE_TYPE_0 -DCONFIG_WLAN_MACHAL_API -DCONFIG_WLAN_MACHAL_API_V0 -DCONFIG_RTL_VAP_SUPPORT -DCONFIG_RTL_CLIENT_MODE_SUPPORT -DCONFIG_RTL_REPEATER_MODE_SUPPORT -DCONFIG_RTL_WPS2_SUPPORT -DCONFIG_RTL_80211D_SUPPORT -DCONFIG_RTL_HW_ENC_GROUP_CIPHER -DCONFIG_TXPWR_LMT -DCONFIG_RTL_8197F_VG -DCONFIG_RTL_SHRINK_MEMORY_SIZE -DCONFIG_RTL_COMAPI_WLTOOLS -DCONFIG_RTL_DISABLE_WLAN_MIPS16 -DCONFIG_RTL_819X -DRX23302_NO_PASSTHRU -DRX23302_NO_WIFI_LED -DCONFIG_RTL_8197F -DCONFIG_SOC_RTL8197F \
++RX23302_DEFS := -DCONFIG_RTL8192CD -DCONFIG_SOC_WIFI -DCONFIG_WLAN_HAL -DCONFIG_WLAN_HAL_88XX -DCONFIG_PCI_HCI -DCONFIG_WIFI_HCI -DCONFIG_RTL_ODM_WLAN_DRIVER -DCONFIG_WLAN_HAL_8197G -DCONFIG_SOC_RFE_TYPE_0 -DCONFIG_BAND_2G_ON_WLAN0 -DCONFIG_2G_ON_WLAN0 -DCONFIG_RTL_VAP_SUPPORT -DCONFIG_RTL_CLIENT_MODE_SUPPORT -DCONFIG_RTL_REPEATER_MODE_SUPPORT -DCONFIG_RTL_WPS2_SUPPORT -DCONFIG_RTL_80211D_SUPPORT -DCONFIG_RTL_HW_ENC_GROUP_CIPHER -DCONFIG_TXPWR_LMT -DCONFIG_RTL_8197F_VG -DCONFIG_RTL_SHRINK_MEMORY_SIZE -DCONFIG_RTL_COMAPI_WLTOOLS -DCONFIG_RTL_DISABLE_WLAN_MIPS16 -DCONFIG_RTL_819X -DRX23302_NO_PASSTHRU -DRX23302_NO_WIFI_LED -DCONFIG_RTL_8197F -DCONFIG_SOC_RTL8197F \
+ 	-DCONFIG_RTL_11W_SUPPORT -DPOWER_PERCENT_ADJUSTMENT -DRTL8192CD_NUM_VWLAN=3 -DRX23302_NUM_STAT=32
+ ccflags-y += $(RX23302_DEFS) -DRX23302_BUILTIN
+diff -ruN a/target/linux/rtl819x/image/Makefile b/target/linux/rtl819x/image/Makefile
+--- a/target/linux/rtl819x/image/Makefile
++++ b/target/linux/rtl819x/image/Makefile
+@@ -79,6 +79,10 @@
+ 	rm -f $@.full
+ endef
+ 
++define Build/dir650in-full
++	$(TOPDIR)/scripts/dir650in-full-image.py $(IMAGE_KERNEL) $(IMAGE_ROOTFS) $@
++endef
++
+ define Build/append-fake-rootfs
+ 	$(call Build/cvimg, \
+ 		-a $(BLOCKSIZE) \
+diff -ruN a/target/linux/rtl819x/image/rtl8197f.mk b/target/linux/rtl819x/image/rtl8197f.mk
+--- a/target/linux/rtl819x/image/rtl8197f.mk
++++ b/target/linux/rtl819x/image/rtl8197f.mk
+@@ -18,3 +18,23 @@
+   CVIMG_CUSTOM_SIGNATURE := KE32
+ endef
+ TARGET_DEVICES += electra_rx23302
++
++# D-Link DIR-650IN (JCG JIR-N700R V1.0), RTL8197FH-VG, 4 MB flash.
++# Same bootloader as the RX23302 ("RTL8197F-VG boot code v3.4.14b"):
++# stock kernel header cr6c, start 0x80a00000, burn offset 0x30000.
++# Bring-up profile: RAM (initramfs) boot only — no flash images yet.
++define Device/dlink_dir-650in
++  CMDLINE := console=ttyS0,38400 rtl8192cd.pcie5g=0
++  SOC := rtl8197f
++  DEVICE_VENDOR := D-Link
++  DEVICE_MODEL := DIR-650IN
++  IMAGE_SIZE := 3776k
++  CVIMG_KERNEL_BURN_ADDR := 0x30000
++  CVIMG_LOADER_START_ADDR := 0x80A00000
++  CVIMG_CUSTOM_SIGNATURE := cr6c
++  IMAGES := kernel.bin rootfs.bin full.bin
++  IMAGE/kernel.bin := append-kernel
++  IMAGE/rootfs.bin := append-rootfs
++  IMAGE/full.bin := dir650in-full
++endef
++TARGET_DEVICES += dlink_dir-650in
+diff -ruN a/target/linux/rtl819x/rtl8197f/config-6.18 b/target/linux/rtl819x/rtl8197f/config-6.18
+--- a/target/linux/rtl819x/rtl8197f/config-6.18
++++ b/target/linux/rtl819x/rtl8197f/config-6.18
+@@ -114,7 +114,7 @@
+ CONFIG_MTD_SPI_NOR_USE_4K_SECTORS=y
+ CONFIG_MTD_ROOTFS_ROOT_DEV=y
+ CONFIG_MTD_SPLIT_FIRMWARE=y
+-# CONFIG_MTD_SPLIT_SQUASHFS_ROOT is not set
++CONFIG_MTD_SPLIT_SQUASHFS_ROOT=y
+ # Выключено намеренно: этот разделитель кладёт место под настройки
+ # сразу за телом squashfs, а ровно там загрузчик держит контрольную
+ # сумму. Первая же запись настроек стёрла бы её, и загрузчик вернул
+@@ -227,9 +227,9 @@
+ CONFIG_REALTEK_PHY=y
+ CONFIG_REGMAP=y
+ CONFIG_PHYLINK=y
+-CONFIG_RTL8366_SMI=y
+-CONFIG_RTL8367B_PHY=y
+-CONFIG_RTL8366_SMI_DEBUG_FS=y
++# CONFIG_RTL8366_SMI is not set
++# CONFIG_RTL8367B_PHY is not set
++# CONFIG_RTL8366_SMI_DEBUG_FS is not set
+ # Радиочасть временно выключена: драйвер доходит до rtl8192cd_init_one
+ # и виснет, а встроенным он собирается только как bool, то есть вешает
+ # всю загрузку. Пока цель — рабочая проводная прошивка в постоянной
+@@ -248,3 +248,9 @@
+ CONFIG_WEXT_CORE=y
+ CONFIG_WEXT_PRIV=y
+ CONFIG_WEXT_PROC=y
++# CONFIG_BPF_SYSCALL is not set
++# CONFIG_BPF_JIT is not set
++# CONFIG_IP_MROUTE is not set
++# CONFIG_IPV6_MROUTE is not set
++# CONFIG_IPV6 is not set
++# CONFIG_NETFILTER is not set
+diff -ruN a/config/Config-build.in b/config/Config-build.in
+--- a/config/Config-build.in
++++ b/config/Config-build.in
+@@ -207,7 +207,8 @@
+ 		  Packages can opt-out via setting PKG_BUILD_FLAGS:=no-mold
+ 
+ 	config IPV6
+-		def_bool y
++		bool "Enable IPv6 support in packages"
++		default y
+ 
+ 	comment "Stripping options"
+ 
+Binary files pristine/scripts/config/conf and ow/scripts/config/conf differ
+Binary files pristine/scripts/config/conf.o and ow/scripts/config/conf.o differ
+Binary files pristine/scripts/config/confdata.o and ow/scripts/config/confdata.o differ
+Binary files pristine/scripts/config/expr.o and ow/scripts/config/expr.o differ
+Binary files pristine/scripts/config/lexer.lex.o and ow/scripts/config/lexer.lex.o differ
+Binary files pristine/scripts/config/menu.o and ow/scripts/config/menu.o differ
+Binary files pristine/scripts/config/parser.tab.o and ow/scripts/config/parser.tab.o differ
+Binary files pristine/scripts/config/preprocess.o and ow/scripts/config/preprocess.o differ
+Binary files pristine/scripts/config/symbol.o and ow/scripts/config/symbol.o differ
+Binary files pristine/scripts/config/util.o and ow/scripts/config/util.o differ
+diff -ruN a/scripts/dir650in-full-image.py b/scripts/dir650in-full-image.py
+--- a/scripts/dir650in-full-image.py
++++ b/scripts/dir650in-full-image.py
+@@ -0,0 +1,67 @@
++#!/usr/bin/env python3
++"""Build ONE flashable image for the D-Link DIR-650IN, laid out exactly like stock:
++
++    flash 0x030000  kernel  (cvimg 'cr6c', start 0x80a00000)  padded 0xFF to 0x210000
++    flash 0x210000  rootfs  (squashfs + RTL819x bootloader checksum)
++                    rootfs_data (jffs2) is created by the kernel after the squashfs,
++                    on the next 64 KiB erase block.
++
++The file is written to flash offset 0x30000 (bootloader: FLW 30000 <ram> <len>).
++Checks, all verified against the stock image of this exact bootloader:
++  - kernel: 'cr6c', start 0x80a00000, burn 0x30000, payload word-sum 0, fits 0x1e0000
++  - rootfs: field@8 + 642 == checked length, word-sum 0, ends before 0x400000
++  - the 2-byte checksum must not fall into the first block of rootfs_data
++Usage: dir650in-full-image.py <kernel.bin> <rootfs.squashfs> <out>"""
++import struct, subprocess, sys, os
++
++KERNEL_OFS, ROOTFS_OFS, FLASH_END, ERASE = 0x30000, 0x210000, 0x400000, 0x10000
++KERNEL_MAX = ROOTFS_OFS - KERNEL_OFS
++MIN_DATA = 3 * ERASE        # jffs2 needs a few erase blocks to be useful
++
++def s16(b):
++    t = 0
++    for i in range(0, len(b) - 1, 2):
++        t = (t + ((b[i] << 8) | b[i + 1])) & 0xFFFF
++    if len(b) % 2:
++        t = (t + (b[-1] << 8)) & 0xFFFF
++    return t
++
++def main():
++    if len(sys.argv) != 4:
++        sys.exit(__doc__)
++    kern = open(sys.argv[1], "rb").read()
++    sig, start, burn, ln = kern[:4], *struct.unpack(">III", kern[4:16])
++    if sig != b"cr6c" or start != 0x80A00000 or burn != KERNEL_OFS:
++        sys.exit(f"kernel header wrong: {sig} 0x{start:X} 0x{burn:X}")
++    if 16 + ln > len(kern) or s16(kern[16:16 + ln]) != 0:
++        sys.exit("kernel payload checksum is not zero")
++    if len(kern) > KERNEL_MAX:
++        sys.exit(f"kernel {len(kern)} bytes > partition {KERNEL_MAX} (over by {len(kern) - KERNEL_MAX})")
++
++    tmp = sys.argv[3] + ".rootfs"
++    open(tmp, "wb").write(open(sys.argv[2], "rb").read())
++    chk = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rtl819x-rootfs-chksum.py")
++    subprocess.run([sys.executable, chk, tmp], check=True)
++    root = open(tmp, "rb").read(); os.unlink(tmp)
++    field = struct.unpack(">I", root[8:12])[0]
++    checked = field + 642
++    if root[:4] != b"hsqs" or checked != len(root) or s16(root) != 0:
++        sys.exit("rootfs checksum layout wrong")
++    used = struct.unpack("<Q", root[40:48])[0]
++    data_start = ROOTFS_OFS + ((used + ERASE - 1) // ERASE) * ERASE   # where mtdsplit puts rootfs_data
++    if ROOTFS_OFS + checked > data_start:
++        sys.exit(f"bootloader checksum would sit in rootfs_data (0x{ROOTFS_OFS + checked:X} > 0x{data_start:X})")
++    if FLASH_END - data_start < MIN_DATA:
++        sys.exit(f"only {FLASH_END - data_start} bytes left for settings (need {MIN_DATA})")
++
++    img = kern + b"\xff" * (KERNEL_MAX - len(kern)) + root
++    # OpenWrt jffs2 "format me" marker at the start of rootfs_data, so leftover
++    # stock data there is wiped on first boot instead of forcing a RAM overlay
++    img += b"\xff" * (data_start - KERNEL_OFS - len(img)) + b"\xde\xad\xc0\xde"
++    open(sys.argv[3], "wb").write(img)
++    print(f"full image {len(img)} bytes -> flash 0x{KERNEL_OFS:X}-0x{KERNEL_OFS + len(img):X}; "
++          f"kernel {len(kern)} (free {KERNEL_MAX - len(kern)}), rootfs {len(root)}, "
++          f"settings 0x{data_start:X}-0x{FLASH_END:X} ({(FLASH_END - data_start) // 1024} KiB)")
++
++if __name__ == "__main__":
++    main()
+diff -ruN a/files/etc/uci-defaults/90-dir650in b/files/etc/uci-defaults/90-dir650in
+--- a/files/etc/uci-defaults/90-dir650in
++++ b/files/etc/uci-defaults/90-dir650in
+@@ -0,0 +1,53 @@
++#!/bin/sh
++# First-boot defaults for the D-Link DIR-650IN repeater build.
++# Setup mode: own AP "Extender-Setup" + LAN 192.168.1.1 with DHCP; uplink (repeater client)
++# exists but stays disabled until it is configured in the web UI (/cgi-bin/api setuplink).
++
++[ "$(cat /tmp/sysinfo/board_name 2>/dev/null)" = "dlink,dir-650in" ] || exit 0
++
++# The target's wifi detect (lib/wifi/rtl8192cd.sh) may already have written the RX23302
++# defaults (default_radio0, SSID RX23302, country RU). On first boot ours always win.
++if ! uci -q get wireless.ap0 >/dev/null; then
++	touch /etc/config/wireless
++	for s in $(uci -q show wireless | sed -n 's/^wireless\.\([^.=]*\)=wifi-iface$/\1/p'); do
++		uci -q delete "wireless.$s"
++	done
++	uci -q delete wireless.radio0
++	uci batch <<-EOF
++		set wireless.radio0=wifi-device
++		set wireless.radio0.type=rtl8192cd
++		set wireless.radio0.ifname=wlan0
++		set wireless.radio0.band=2g
++		set wireless.radio0.channel=1
++		set wireless.radio0.htmode=HT20
++		set wireless.radio0.country=IN
++		set wireless.ap0=wifi-iface
++		set wireless.ap0.device=radio0
++		set wireless.ap0.network=lan
++		set wireless.ap0.mode=ap
++		set wireless.ap0.ssid=Extender-Setup
++		set wireless.ap0.encryption=psk2
++		set wireless.ap0.key=extender-setup
++		set wireless.uplink=wifi-iface
++		set wireless.uplink.device=radio0
++		set wireless.uplink.network=lan
++		set wireless.uplink.mode=sta
++		set wireless.uplink.encryption=psk2
++		set wireless.uplink.disabled=1
++	EOF
++	uci commit wireless
++fi
++
++# web UI on the LAN only, plain HTTP (no TLS stack in this 4 MB image)
++uci -q batch <<-EOF
++	delete uhttpd.main.listen_https
++	set uhttpd.main.index_page=index.html
++	set uhttpd.main.cgi_prefix=/cgi-bin
++	set uhttpd.main.redirect_https=0
++EOF
++uci commit uhttpd
++
++uci set system.@system[0].hostname=extender
++uci commit system
++
++exit 0
+diff -ruN a/files/www/cgi-bin/api b/files/www/cgi-bin/api
+--- a/files/www/cgi-bin/api
++++ b/files/www/cgi-bin/api
+@@ -0,0 +1,148 @@
++#!/bin/sh
++# DIR-650IN repeater UI backend (uhttpd CGI). GET ?a=status|scan ; POST a=<action>&...
++# Every reply is JSON. State-changing actions need POST with Content-Type application/x-dir650in-form.
++
++js() { # JSON string literal
++	printf '"%s"' "$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\000-\037')"
++}
++out() { printf 'Content-Type: application/json\r\nCache-Control: no-store\r\n\r\n%s\n' "$1"; exit 0; }
++fail() { out "{\"ok\":false,\"error\":$(js "$1")}"; }
++urldec() { local v; v=$(printf '%s' "$1" | sed -e 's/+/ /g' -e 's/%\([0-9A-Fa-f][0-9A-Fa-f]\)/\\x\1/g'); printf '%b' "$v"; }
++param() { # param NAME from $BODY or $QUERY_STRING
++	local kv
++	printf '%s&%s\n' "$BODY" "$QUERY_STRING" | tr '&' '\n' | while IFS= read -r kv; do
++		[ "${kv%%=*}" = "$1" ] && { urldec "${kv#*=}"; break; }
++	done
++}
++
++BODY=""
++if [ "$REQUEST_METHOD" = POST ]; then
++	[ "${CONTENT_LENGTH:-0}" -le 4096 ] || fail "request too large"
++	BODY=$(dd bs=1 count="${CONTENT_LENGTH:-0}" 2>/dev/null)
++	# CSRF guard: a non-standard content type cannot be sent cross-origin without a CORS
++	# preflight, which uhttpd never answers (uhttpd does not pass custom headers to CGI).
++	case "$CONTENT_TYPE" in application/x-dir650in*) ;; *) fail "bad request type" ;; esac
++fi
++A=$(param a)
++
++# true when root has a real password hash in /etc/shadow
++has_pw() { awk -F: '$1=="root"{f=1; exit ($2==""||$2=="*"||$2=="!"||$2=="x")} END{if(!f) exit 1}' /etc/shadow; }
++# before an admin password exists only status and setpw are allowed
++if ! has_pw; then
++	case "$A" in status|setpw) ;; *) fail "set the admin password first" ;; esac
++fi
++
++mode() { [ "$(uci -q get wireless.uplink.disabled)" = 0 ] && echo repeater || echo setup; }
++
++apply_bg() { ( sleep 1; wifi reload; /etc/init.d/network reload; /etc/init.d/dnsmasq restart ) >/dev/null 2>&1 & }
++
++case "$A" in
++status)
++	up=$(cut -d. -f1 /proc/uptime)
++	mt=$(awk '/MemTotal/{print $2}' /proc/meminfo); ma=$(awk '/MemAvailable/{print $2}' /proc/meminfo)
++	ch=$(awk '/dot11channel/{print $2; exit}' /proc/wlan0/mib_rf 2>/dev/null)
++	ips=$(ip -4 -o addr show br-lan 2>/dev/null | awk '{printf "%s%s", s, $4; s=","}')
++	# uplink: first station entry on the repeater interface = the upstream AP
++	ul_mac=""; ul_rssi=""; ul_state=""
++	if [ -r /proc/wlan0-vxd/sta_info ]; then
++		eval "$(awk '/hwaddr:/{m=$2} /state:/{s=$2} /rssi:/{r=$2; if(m!=""){printf "ul_mac=%s ul_state=%s ul_rssi=%s\n",m,s,r; exit}}' /proc/wlan0-vxd/sta_info)"
++	fi
++	clients=$(awk '/hwaddr:/{m=$2} /rssi:/{if(m!=""){printf "%s{\"mac\":\"%s\",\"rssi\":%s}", s, m, $2; s=","; m=""}}' /proc/wlan0/sta_info 2>/dev/null)
++	out "{\"ok\":true,\"pw\":$(has_pw && echo true || echo false),\"mode\":\"$(mode)\",\"uptime\":${up:-0},\"mem_total\":${mt:-0},\"mem_avail\":${ma:-0},\"channel\":${ch:-0},\"ips\":$(js "$ips"),\"ap_ssid\":$(js "$(uci -q get wireless.ap0.ssid)"),\"up_ssid\":$(js "$(uci -q get wireless.uplink.ssid)"),\"up_mac\":$(js "$ul_mac"),\"up_rssi\":${ul_rssi:-0},\"up_connected\":$([ -n "$ul_mac" ] && echo true || echo false),\"clients\":[${clients}]}"
++	;;
++scan)
++	echo 1 > /proc/wlan0/SS_Result 2>/dev/null
++	i=0
++	while [ $i -lt 12 ] && grep -q waitting /proc/wlan0/SS_Result 2>/dev/null; do sleep 1; i=$((i+1)); done
++	list=$(awk -F': ' '
++		/HwAddr:/  {m=$2}
++		/Channel:/ {c=$2}
++		/SSID:/    {sub(/^[ \t]*SSID: /,""); s=$0; gsub(/\\/,"\\\\",s); gsub(/"/,"\\\"",s)}
++		/RSSI:/    {r=$2}
++		/====/     {if(m!=""){printf "%s{\"bssid\":\"%s\",\"channel\":%d,\"ssid\":\"%s\",\"rssi\":%d}", sep, m, c, s, r; sep=","; m=""}}
++	' /proc/wlan0/SS_Result 2>/dev/null)
++	out "{\"ok\":true,\"networks\":[${list}]}"
++	;;
++setpw)
++	[ "$REQUEST_METHOD" = POST ] || fail "POST required"
++	pw=$(param pw)
++	[ ${#pw} -ge 8 ] || fail "password must be at least 8 characters"
++	printf '%s\n%s\n' "$pw" "$pw" | passwd root >/dev/null 2>&1 || fail "passwd failed"
++	# protect the whole site with the system root password from now on
++	[ -f /etc/httpd.conf ] || { echo '/:root:$p$root' > /etc/httpd.conf; uci set uhttpd.main.config=/etc/httpd.conf; uci commit uhttpd; ( sleep 1; /etc/init.d/uhttpd restart ) >/dev/null 2>&1 & }
++	out '{"ok":true}'
++	;;
++setap)
++	[ "$REQUEST_METHOD" = POST ] || fail "POST required"
++	ssid=$(param ssid); key=$(param key)
++	[ -n "$ssid" ] && [ ${#ssid} -le 32 ] || fail "network name must be 1-32 characters"
++	[ ${#key} -ge 8 ] && [ ${#key} -le 63 ] || fail "Wi-Fi password must be 8-63 characters"
++	uci set wireless.ap0.ssid="$ssid"; uci set wireless.ap0.key="$key"; uci set wireless.ap0.encryption=psk2
++	uci commit wireless; apply_bg
++	out '{"ok":true}'
++	;;
++setuplink)
++	[ "$REQUEST_METHOD" = POST ] || fail "POST required"
++	ssid=$(param ssid); key=$(param key); bssid=$(param bssid)
++	[ -n "$ssid" ] && [ ${#ssid} -le 32 ] || fail "upstream network name must be 1-32 characters"
++	if [ -n "$key" ]; then
++		[ ${#key} -ge 8 ] && [ ${#key} -le 63 ] || fail "upstream password must be 8-63 characters"
++		uci set wireless.uplink.encryption=psk2; uci set wireless.uplink.key="$key"
++	else
++		uci set wireless.uplink.encryption=none; uci -q delete wireless.uplink.key
++	fi
++	uci set wireless.uplink.ssid="$ssid"
++	if [ -n "$bssid" ]; then uci set wireless.uplink.bssid="$bssid"; else uci -q delete wireless.uplink.bssid; fi
++	uci set wireless.uplink.disabled=0
++	# repeater: LAN takes its address from the upstream router, 192.168.1.1 stays for management
++	uci set network.lan.proto=dhcp; uci -q delete network.lan.ipaddr; uci -q delete network.lan.netmask
++	uci set network.mgmt=interface; uci set network.mgmt.device=br-lan; uci set network.mgmt.proto=static
++	uci set network.mgmt.ipaddr=192.168.1.1/24
++	uci set dhcp.lan.ignore=1
++	uci commit wireless; uci commit network; uci commit dhcp; apply_bg
++	out '{"ok":true}'
++	;;
++clearuplink)
++	[ "$REQUEST_METHOD" = POST ] || fail "POST required"
++	uci set wireless.uplink.disabled=1
++	uci set network.lan.proto=static; uci set network.lan.ipaddr=192.168.1.1; uci set network.lan.netmask=255.255.255.0
++	uci -q delete network.mgmt
++	uci -q delete dhcp.lan.ignore
++	uci commit wireless; uci commit network; uci commit dhcp; apply_bg
++	out '{"ok":true}'
++	;;
++setip)
++	# fixed address on the home network (repeater mode); empty = take it from DHCP
++	[ "$REQUEST_METHOD" = POST ] || fail "POST required"
++	[ "$(mode)" = repeater ] || fail "only available in repeater mode"
++	ip=$(param ip)
++	if [ -z "$ip" ]; then
++		uci set network.lan.proto=dhcp
++		for o in ipaddr netmask gateway dns; do uci -q delete network.lan.$o; done
++	else
++		echo "$ip" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$' || fail "not an IPv4 address"
++		gw=$(ip -4 route show default | awk '{print $3; exit}')
++		[ -n "$gw" ] || fail "no upstream gateway yet - connect first"
++		[ "${ip%.*}" = "${gw%.*}" ] || fail "address must be in the same network as $gw"
++		[ "$ip" != "$gw" ] || fail "that is the main router's address"
++		uci set network.lan.proto=static; uci set network.lan.ipaddr="$ip"; uci set network.lan.netmask=255.255.255.0
++		uci set network.lan.gateway="$gw"; uci -q delete network.lan.dns; uci add_list network.lan.dns="$gw"
++	fi
++	uci commit network
++	( sleep 1; /etc/init.d/network reload ) >/dev/null 2>&1 &
++	out "{\"ok\":true,\"ip\":$(js "$ip")}"
++	;;
++reboot)
++	[ "$REQUEST_METHOD" = POST ] || fail "POST required"
++	( sleep 1; reboot ) >/dev/null 2>&1 &
++	out '{"ok":true}'
++	;;
++factory)
++	[ "$REQUEST_METHOD" = POST ] || fail "POST required"
++	( sleep 1; firstboot -y; reboot ) >/dev/null 2>&1 &
++	out '{"ok":true}'
++	;;
++*)
++	fail "unknown action"
++	;;
++esac
+diff -ruN a/files/www/index.html b/files/www/index.html
+--- a/files/www/index.html
++++ b/files/www/index.html
+@@ -0,0 +1,154 @@
++<!doctype html>
++<html lang="en">
++<head>
++<meta charset="utf-8">
++<meta name="viewport" content="width=device-width,initial-scale=1">
++<title>Extender</title>
++<style>
++:root{--bg:#f4f5f7;--card:#fff;--fg:#1c1f23;--mut:#6b7280;--line:#e4e6ea;--acc:#2563eb;--ok:#15803d;--bad:#b91c1c;--warn:#b45309}
++@media (prefers-color-scheme:dark){:root{--bg:#111418;--card:#1a1e24;--fg:#e8eaed;--mut:#9aa0a6;--line:#2a2f37;--acc:#60a5fa;--ok:#4ade80;--bad:#f87171;--warn:#fbbf24}}
++*{box-sizing:border-box}
++body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
++header{padding:16px;display:flex;align-items:center;justify-content:space-between;max-width:720px;margin:auto}
++h1{font-size:18px;margin:0}
++main{max-width:720px;margin:auto;padding:0 16px 32px}
++.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:14px}
++h2{font-size:15px;margin:0 0 12px}
++.row{display:flex;justify-content:space-between;gap:12px;padding:6px 0;border-top:1px solid var(--line)}
++.row:first-of-type{border-top:0}
++.k{color:var(--mut)}
++.v{text-align:right;word-break:break-all}
++label{display:block;font-size:13px;color:var(--mut);margin:10px 0 4px}
++input{width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg);font:inherit}
++button{font:inherit;padding:10px 14px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--fg);cursor:pointer}
++button.p{background:var(--acc);border-color:var(--acc);color:#fff}
++button.d{color:var(--bad)}
++button:disabled{opacity:.5;cursor:default}
++.btns{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}
++.pill{display:inline-block;padding:2px 10px;border-radius:999px;font-size:13px;border:1px solid currentColor}
++.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}
++.net{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:10px 0;border-top:1px solid var(--line);cursor:pointer}
++.net:first-child{border-top:0}
++.net.sel{color:var(--acc)}
++.bars{font-variant-numeric:tabular-nums;color:var(--mut);white-space:nowrap}
++#msg{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);background:var(--fg);color:var(--bg);padding:10px 16px;border-radius:8px;display:none;max-width:90%}
++.hide{display:none}
++</style>
++</head>
++<body>
++<header><h1>Extender</h1><span id="mode" class="pill"></span></header>
++<main>
++
++<section id="pwcard" class="card hide">
++  <h2>Set an admin password</h2>
++  <p class="k">The router has no password yet. Choose one (8+ characters). You'll log in with user <b>root</b> and this password.</p>
++  <label for="pw1">New password</label><input id="pw1" type="password" autocomplete="new-password">
++  <label for="pw2">Repeat password</label><input id="pw2" type="password" autocomplete="new-password">
++  <div class="btns"><button class="p" onclick="setpw()">Save password</button></div>
++</section>
++
++<div id="app" class="hide">
++<section class="card">
++  <h2>Status</h2>
++  <div class="row"><span class="k">Upstream</span><span class="v" id="s_up">—</span></div>
++  <div class="row"><span class="k">Signal</span><span class="v" id="s_sig">—</span></div>
++  <div class="row"><span class="k">Channel</span><span class="v" id="s_ch">—</span></div>
++  <div class="row"><span class="k">Router address</span><span class="v" id="s_ip">—</span></div>
++  <div class="row"><span class="k">Wi-Fi clients</span><span class="v" id="s_cl">—</span></div>
++  <div class="row"><span class="k">Uptime</span><span class="v" id="s_ut">—</span></div>
++  <div class="row"><span class="k">Free memory</span><span class="v" id="s_mem">—</span></div>
++</section>
++
++<section class="card">
++  <h2>Upstream network (repeat this Wi-Fi)</h2>
++  <div id="nets"><span class="k">Press Scan to find networks.</span></div>
++  <label for="u_ssid">Network name</label><input id="u_ssid" autocomplete="off">
++  <label for="u_key">Password (empty for open networks)</label><input id="u_key" type="password" autocomplete="off">
++  <div class="btns">
++    <button onclick="scan()" id="b_scan">Scan</button>
++    <button class="p" onclick="uplink()">Connect &amp; repeat</button>
++    <button class="d" onclick="clearup()">Stop repeating</button>
++  </div>
++</section>
++
++<section class="card">
++  <h2>Your Wi-Fi (what this router broadcasts)</h2>
++  <label for="a_ssid">Network name</label><input id="a_ssid" autocomplete="off">
++  <label for="a_key">Password (8–63 characters)</label><input id="a_key" type="password" autocomplete="new-password">
++  <div class="btns"><button class="p" onclick="setap()">Save</button></div>
++</section>
++
++<section class="card">
++  <h2>How to reach this page</h2>
++  <p class="k">On your home network open <b>http://extender.local</b> or the address below. 192.168.1.1 works only from a device plugged into a LAN port with a 192.168.1.x address.</p>
++  <label for="f_ip">Fixed address on your home network (repeater mode, empty = automatic)</label>
++  <input id="f_ip" placeholder="e.g. 192.168.1.250" inputmode="decimal" autocomplete="off">
++  <div class="btns"><button onclick="setip()">Save address</button></div>
++</section>
++
++<section class="card">
++  <h2>System</h2>
++  <label for="n_pw">Change admin password</label><input id="n_pw" type="password" autocomplete="new-password">
++  <div class="btns">
++    <button onclick="chpw()">Change password</button>
++    <button onclick="act('reboot','Rebooting…')">Reboot</button>
++    <button class="d" onclick="if(confirm('Erase all settings and reboot?'))act('factory','Resetting…')">Factory reset</button>
++  </div>
++</section>
++</div>
++</main>
++<div id="msg"></div>
++<script>
++const $=id=>document.getElementById(id);
++let selBssid="";
++function toast(t,ms){const m=$('msg');m.textContent=t;m.style.display='block';clearTimeout(m._t);m._t=setTimeout(()=>m.style.display='none',ms||3500)}
++async function api(a,data){
++  const opt=data?{method:'POST',headers:{'Content-Type':'application/x-dir650in-form'},
++    body:new URLSearchParams(Object.assign({a},data)).toString()}:{};
++  const r=await fetch('/cgi-bin/api'+(data?'':'?a='+a),opt);
++  const j=await r.json();
++  if(!j.ok)throw new Error(j.error||'failed');
++  return j;
++}
++function sig(r){return r>=60?'▂▄▆█':r>=45?'▂▄▆':r>=30?'▂▄':'▂'}
++function dur(s){const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return(d?d+'d ':'')+h+'h '+m+'m'}
++async function refresh(){
++  let s;
++  try{s=await api('status')}catch(e){return}
++  $('pwcard').classList.toggle('hide',s.pw);
++  $('app').classList.toggle('hide',!s.pw);
++  const md=$('mode');md.textContent=s.mode==='repeater'?'Repeater':'Setup';md.className='pill '+(s.mode==='repeater'?'ok':'warn');
++  if(s.mode==='repeater'){
++    $('s_up').innerHTML=s.up_connected?'<span class="ok">Connected</span> to '+esc(s.up_ssid):'<span class="bad">Not connected</span> ('+esc(s.up_ssid)+')';
++    $('s_sig').textContent=s.up_connected?sig(s.up_rssi)+'  '+s.up_rssi+'%':'—';
++  }else{$('s_up').textContent='Not configured';$('s_sig').textContent='—'}
++  $('s_ch').textContent=s.channel||'—';
++  $('s_ip').textContent=s.ips.replace(/,/g,', ')||'—';
++  $('s_cl').textContent=s.clients.length;
++  $('s_ut').textContent=dur(s.uptime);
++  $('s_mem').textContent=Math.round(s.mem_avail/1024)+' / '+Math.round(s.mem_total/1024)+' MB';
++  if(!$('a_ssid').value&&document.activeElement!==$('a_ssid'))$('a_ssid').value=s.ap_ssid;
++  if(!$('u_ssid').value&&document.activeElement!==$('u_ssid'))$('u_ssid').value=s.up_ssid;
++}
++function esc(t){return String(t).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
++async function scan(){
++  const b=$('b_scan');b.disabled=true;b.textContent='Scanning…';
++  try{
++    const r=await api('scan');const n=r.networks.filter(x=>x.ssid).sort((a,b)=>b.rssi-a.rssi);
++    $('nets').innerHTML=n.length?n.map(x=>`<div class="net" data-s="${esc(x.ssid)}" data-b="${x.bssid}"><span>${esc(x.ssid)}</span><span class="bars">${sig(x.rssi)} ch${x.channel}</span></div>`).join(''):'<span class="k">No networks found.</span>';
++    document.querySelectorAll('.net').forEach(el=>el.onclick=()=>{document.querySelectorAll('.net').forEach(e=>e.classList.remove('sel'));el.classList.add('sel');$('u_ssid').value=el.dataset.s;selBssid='';$('u_key').focus()});
++  }catch(e){toast(e.message)}
++  b.disabled=false;b.textContent='Scan';
++}
++async function run(a,d,okmsg){try{await api(a,d);toast(okmsg,6000)}catch(e){toast(e.message)}}
++function uplink(){run('setuplink',{ssid:$('u_ssid').value,key:$('u_key').value,bssid:selBssid},'Connecting… the router keeps 192.168.1.1 for this page.')}
++function clearup(){if(confirm('Stop repeating and go back to setup mode?'))run('clearuplink',{},'Back to setup mode.')}
++function setap(){run('setap',{ssid:$('a_ssid').value,key:$('a_key').value},'Saved. Reconnect to the new Wi-Fi if you changed it.')}
++async function setpw(){if($('pw1').value!==$('pw2').value)return toast('Passwords do not match');await run('setpw',{pw:$('pw1').value},'Password set. Log in as root.');setTimeout(()=>location.reload(),2500)}
++function chpw(){run('setpw',{pw:$('n_pw').value},'Password changed.')}
++function setip(){const v=$('f_ip').value.trim();run('setip',{ip:v},v?'Saved. Open http://'+v+' (or extender.local).':'Address is automatic again.')}
++function act(a,t){run(a,{},t)}
++refresh();setInterval(refresh,5000);
++</script>
++</body>
++</html>
