@@ -34,13 +34,17 @@ Details, register dumps and the stock flash map: [docs/HARDWARE.md](docs/HARDWAR
 | ✅ Ethernet, all 5 jacks | internal-PHY mode added to the RX23302 driver |
 | ✅ Wi-Fi AP, WPA2-PSK | built-in 2.4 GHz radio |
 | ✅ **Repeater** | client on the driver's `wlan0-vxd` + AP on `wlan0`, one bridge with all LAN jacks |
+| ✅ Factory RF calibration | per-channel TX power, crystal trim (`xcap`) and thermal reference loaded from the hwsetting block at every Wi-Fi start |
+| ✅ DHCP for repeater clients | `dhcprelay` service relays client DHCP to the main router (NAT25 on the uplink drops the replies otherwise) |
+| ✅ Full-speed client uplink | LDPC receive is off by default: with it on, clients fall back to MCS0 |
 | ✅ Web UI (`extender`) | status, scan + join upstream, own SSID/password, fixed IP, admin password, reboot, factory reset |
 | ✅ `extender.local` | mDNS (umdns); Android often cannot resolve `.local` - use the IP |
 | ✅ SSH | dropbear |
 | ✅ Settings persist | jffs2 overlay, ~700 KB |
 | ❌ Reset button / LEDs | GPIOs not mapped yet |
 | ❌ 5 GHz | the board has no 5 GHz radio |
-| ❌ Firmware upgrade from the UI | flash via UART/bootloader for now |
+| ✅ `sysupgrade` over SSH | DIR-650IN `platform.sh`, keeps settings (`sysupgrade -T` first) |
+| ❌ Firmware upgrade from the UI | use `sysupgrade` over SSH, or UART/bootloader |
 
 ### Trimmed to fit 4 MB
 
@@ -66,6 +70,32 @@ status page and in the main router's client list as `extender`) and keeps `192.1
 devices plugged into a LAN port with a `192.168.1.x` address. A fixed address can be set in the UI.
 
 Don't also cable the extender into the main router while it repeats over Wi-Fi - that makes a loop.
+
+### Repeater performance notes
+
+- **DHCP relay.** The uplink is a plain client interface, so the driver's NAT25 MAC translation
+  carries other clients' traffic. It loses the main router's DHCP replies, and clients fall back
+  to IPv6-only (macOS shows `192.0.0.2`). `/etc/init.d/dhcprelay` relays DHCP to the main router
+  while repeating with the local DHCP server off; it reads the LAN address and gateway at start.
+- **Calibration.** Without the factory values the driver runs with `xcap=0` and empty power
+  tables. Loading them raised a nearby client's RSSI at the extender from ~32 to ~50.
+- **LDPC receive.** With RX LDPC advertised, a client 1-2 m away sent at MCS0 (5 Mbit/s) with
+  ~47% retries. With `rxldpc` off it sends at MCS15: measured throughput through the repeater
+  went from ~5 to ~20 Mbit/s down and ~10 to ~30 Mbit/s up. Set `wireless.radio0.rxldpc=1`
+  to re-enable it.
+- **Channel width follows the uplink.** The driver gives the AP the upstream AP's width. `HT40`
+  here only takes effect when the main router's 2.4 GHz runs at 40 MHz.
+
+### Upgrading
+
+```sh
+scp -O openwrt-*-dlink_dir-650in-squashfs-full.bin root@extender.local:/tmp/
+ssh root@extender.local 'sysupgrade -T /tmp/openwrt-*-full.bin && sysupgrade -v /tmp/openwrt-*-full.bin'
+```
+
+Images built before this `platform.sh` existed ship the RX23302 one, whose 16 MB offsets would
+write the wrong places on this flash. On those, copy `files/lib/upgrade/platform.sh` from this
+repo to `/lib/upgrade/platform.sh` on the extender before running `sysupgrade`.
 
 ## Building
 
@@ -110,7 +140,11 @@ What `patches/dir650in.patch` contains:
 - `board.d/02_network` - all jacks on one LAN bridge for this board
 - image rules + `scripts/dir650in-full-image.py` - stock-compatible flash image with checks
 - `config/Config-build.in` - make OpenWrt's `IPV6` selectable (to drop it)
-- `files/` - the web UI (`/www`) and first-boot defaults
+- `files/` - the web UI (`/www`), first-boot defaults, the `dhcprelay` service and the
+  DIR-650IN `sysupgrade` script (`lib/upgrade/platform.sh`)
+- `rtl8192cd.sh` also loads the factory RF calibration and defaults RX LDPC off
+- `dir650in.diffconfig` builds `libmbedtls` as a module: `ustream-ssl`, a build dependency of
+  `uhttpd`, fails without its headers
 
 ## Credits & license
 
