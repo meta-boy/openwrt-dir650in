@@ -33,7 +33,8 @@ if [ ! -f .dir650in-applied ]; then
 	cp -a "$B/rx23302/openwrt/." .
 	git apply "$B/rx23302/openwrt-upstream.patch"
 	patch -p1 -s < "$HERE/patches/dir650in.patch"
-	chmod 755 scripts/dir650in-full-image.py files/www/cgi-bin/api files/etc/uci-defaults/90-dir650in
+	chmod 755 scripts/dir650in-full-image.py files/www/cgi-bin/api files/etc/uci-defaults/90-dir650in \
+		files/etc/uci-defaults/91-dhcprelay files/etc/init.d/dhcprelay
 	touch .dir650in-applied
 fi
 
